@@ -5,13 +5,13 @@ import { Pinecone } from '@pinecone-database/pinecone';
 
 // ========== CONFIGURATION ==========
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const OPENAI_API_KEY = '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';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
 
 // ⚠️ UPDATE THESE WITH YOUR PR DETAILS
 const REPO_OWNER = 'niravasher-frontend';  // Your GitHub username
 const REPO_NAME = 'Smart-Payment'; // Your repo name
-const PR_NUMBER = 2;               // The PR number to review
+const PR_NUMBER = 3;               // The PR number to review
 
 // ========== INITIALIZE CLIENTS ==========
 console.log('🔧 Initializing clients...');
@@ -35,6 +35,40 @@ async function createEmbedding(text) {
   const model = await getEmbedder();
   const output = await model(text, { pooling: 'mean', normalize: true });
   return Array.from(output.data);
+}
+
+// Parse diff to map line numbers to diff positions
+// GitHub requires "position" (line number in the diff), not actual file line numbers
+function parseDiffPositions(patch) {
+  const lines = patch.split('\n');
+  const positions = {};
+  let diffPosition = 0;
+  let currentNewLine = 0;
+
+  for (const line of lines) {
+    diffPosition++;
+    
+    // Parse @@ -old_start,old_count +new_start,new_count @@ markers
+    const hunkMatch = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunkMatch) {
+      currentNewLine = parseInt(hunkMatch[1], 10) - 1; // -1 because we'll increment on next line
+      continue;
+    }
+
+    // Context line (unchanged) - exists in both old and new
+    if (!line.startsWith('-') && !line.startsWith('+')) {
+      currentNewLine++;
+    }
+    // Added line - only in new file
+    else if (line.startsWith('+') && !line.startsWith('+++')) {
+      currentNewLine++;
+      positions[currentNewLine] = diffPosition;  // Map new file line number to diff position
+    }
+    // Removed line - only in old file (don't increment currentNewLine)
+    // We don't map these since they're not in the new file
+  }
+
+  return positions;
 }
 
 // ========== MAIN REVIEW FUNCTION ==========
@@ -80,34 +114,23 @@ async function runLocalReview() {
       return;
     }
 
-    // Step 3: Get file contents
-    console.log('\n📄 Step 3: Fetching file contents...');
-    const fileContents = await Promise.all(
-      codeFiles.map(async (file) => {
-        try {
-          const { data } = await octokit.repos.getContent({
-            owner: REPO_OWNER,
-            repo: REPO_NAME,
-            path: file.filename,
-            ref: pullRequest.head.sha
-          });
-          
-          const content = Buffer.from(data.content, 'base64').toString('utf-8');
-          console.log(`   ✅ ${file.filename} (${content.length} chars)`);
-          return {
-            filename: file.filename,
-            patch: file.patch,
-            content: content
-          };
-        } catch (error) {
-          console.error(`   ❌ Error fetching ${file.filename}:`, error.message);
-          return null;
-        }
-      })
-    );
+    // Step 3: Extract diffs only (no full file fetch needed)
+    console.log('\n📄 Step 3: Extracting diffs from PR...');
+    const fileDiffs = codeFiles
+      .filter(file => file.patch) // Only files with actual changes
+      .map(file => {
+        console.log(`   ✅ ${file.filename} (+${file.additions}/-${file.deletions})`);
+        return {
+          filename: file.filename,
+          status: file.status, // added, modified, removed
+          additions: file.additions,
+          deletions: file.deletions,
+          patch: file.patch // This is the diff!
+        };
+      });
 
-    const validFiles = fileContents.filter(f => f !== null);
-    console.log(`✅ Retrieved ${validFiles.length} file contents`);
+    const validFiles = fileDiffs;
+    console.log(`✅ Extracted diffs for ${validFiles.length} files`);
 
     // Step 4: Query knowledge base
     console.log('\n🔍 Step 4: Querying knowledge base (Pinecone)...');
@@ -150,34 +173,52 @@ async function runLocalReview() {
       ? relevantContext.map(m => m.metadata?.content || '').join('\n\n---\n\n')
       : 'No additional context available.';
 
-    // Build files string
-    const filesString = validFiles.map(f => 
-      `### File: ${f.filename}\n\`\`\`\n${f.patch || f.content.substring(0, 1000)}\n\`\`\``
+    // Build diff string - focus ONLY on the changes
+    const diffString = validFiles.map(f => 
+      `### File: ${f.filename} (${f.status}: +${f.additions}/-${f.deletions})\n\`\`\`diff\n${f.patch}\n\`\`\``
     ).join('\n\n');
 
     const prompt = `
 You are a senior software engineer reviewing a pull request.
+**IMPORTANT: Review ONLY the changes shown in the diff below. Return your review as JSON.**
 
 ## PR Information:
 - **Title:** ${pullRequest.title}
 - **Description:** ${pullRequest.body || 'No description provided'}
-- **Author:** ${pullRequest.user.login}
 
-## Files Changed:
-${filesString}
+## Changes to Review (Diff):
+Lines starting with + are additions (new code), lines starting with - are deletions (removed code).
+The @@ markers show line numbers: @@ -old_start,old_count +new_start,new_count @@
+
+${diffString}
 
 ## Relevant Codebase Context:
-${contextString.substring(0, 3000)}
+${contextString.substring(0, 2000)}
 
-## Your Task:
-Please provide a thorough code review focusing on:
-1. **Code Quality:** Best practices, readability, maintainability
-2. **Potential Bugs:** Logic errors, edge cases, error handling
-3. **Security:** Any security concerns or vulnerabilities
-4. **Performance:** Any performance implications
-5. **Suggestions:** Specific improvements with code examples
+## OUTPUT FORMAT:
+Return a JSON object with this EXACT structure:
+{
+  "summary": "2-3 sentence overall summary of the PR quality and main concerns",
+  "inlineComments": [
+    {
+      "file": "path/to/file.js",
+      "line": 42,
+      "severity": "error|warning|suggestion|info",
+      "comment": "DETAILED feedback for this line including:\\n- What the issue is\\n- Why it's a problem\\n- How to fix it (with code example if applicable)"
+    }
+  ]
+}
 
-Be constructive, specific, and helpful. Reference line numbers when possible.
+## RULES:
+1. Each inline comment must be DETAILED and COMPREHENSIVE - include the problem, why it matters, and the fix
+2. Include code snippets in comments showing the correct approach when relevant
+3. Each comment must reference a SPECIFIC line number where NEW code was ADDED (lines with +)
+4. severity: "error" = bugs/security, "warning" = potential issues, "suggestion" = improvements, "info" = notes
+5. Include 10-20 inline comments covering ALL important issues
+6. Format comments in markdown (use code blocks, bold, etc.)
+7. Be thorough - each comment should be self-contained with full context
+
+Return ONLY valid JSON, no markdown code blocks, no extra text.
 `;
 
     console.log(`✅ Prompt built (${prompt.length} chars)`);
@@ -190,7 +231,7 @@ Be constructive, specific, and helpful. Reference line numbers when possible.
       messages: [
         {
           role: "system",
-          content: "You are a senior software engineer performing code reviews. Be helpful, specific, and constructive."
+          content: "You are a senior software engineer performing code reviews. Return ONLY valid JSON, no markdown."
         },
         {
           role: "user",
@@ -201,31 +242,108 @@ Be constructive, specific, and helpful. Reference line numbers when possible.
       temperature: 0.3
     });
 
-    console.log('   Full API response:', JSON.stringify(completion, null, 2));
+    const rawResponse = completion.choices[0].message.content || '{}';
+    console.log(`✅ Received response (${rawResponse.length} chars)`);
     
-    const reviewComment = completion.choices[0].message.content || 'No review generated';
-    console.log(`✅ Received review (${reviewComment.length} chars)`);
+    // Parse JSON response
+    let reviewData;
+    try {
+      // Clean up response - remove markdown code blocks if present
+      let cleanJson = rawResponse.trim();
+      if (cleanJson.startsWith('```')) {
+        cleanJson = cleanJson.replace(/^```json?\n?/, '').replace(/\n?```$/, '');
+      }
+      reviewData = JSON.parse(cleanJson);
+    } catch (parseError) {
+      console.error('❌ Failed to parse JSON response:', parseError.message);
+      console.log('Raw response:', rawResponse);
+      return;
+    }
+
     console.log('\n' + '-'.repeat(60));
-    console.log('📋 GENERATED REVIEW:');
+    console.log('📋 PARSED REVIEW:');
     console.log('-'.repeat(60));
-    console.log(reviewComment);
+    console.log(`Summary: ${reviewData.summary}`);
+    console.log(`Inline Comments: ${reviewData.inlineComments?.length || 0}`);
+    reviewData.inlineComments?.forEach((c, i) => {
+      console.log(`  ${i + 1}. [${c.severity}] ${c.file}:${c.line}`);
+      console.log(`      ${c.comment.substring(0, 100)}...`);
+    });
     console.log('-'.repeat(60) + '\n');
 
-    // Step 7: Post comment to GitHub
-    console.log('💬 Step 7: Posting review comment to GitHub...');
+    // Step 7: Post to GitHub
+    console.log('💬 Step 7: Posting review to GitHub...');
     
-    const contextInfo = relevantContext.length > 0 
-      ? `\n*📚 Analyzed with ${relevantContext.length} pieces of codebase context*`
-      : '';
-
-    await octokit.issues.createComment({
+    // Get the latest commit SHA for the PR
+    const { data: prCommits } = await octokit.pulls.listCommits({
       owner: REPO_OWNER,
       repo: REPO_NAME,
-      issue_number: PR_NUMBER,
-      body: `## 🤖 AI Code Review (RAG-Enhanced)\n\n${reviewComment}\n\n---\n*🧠 Powered by GPT-5.1 + Knowledge Base | Context-Aware Review*${contextInfo}`
+      pull_number: PR_NUMBER
     });
+    const latestCommitSha = prCommits[prCommits.length - 1].sha;
+    console.log(`   Using commit SHA: ${latestCommitSha}`);
 
-    console.log('✅ Review comment posted successfully!');
+    // Build diff position map for each file
+    const diffPositionMap = {};
+    for (const file of codeFiles) {
+      if (file.patch) {
+        diffPositionMap[file.filename] = parseDiffPositions(file.patch);
+      }
+    }
+
+    // Convert inline comments to GitHub review comments format
+    const reviewComments = [];
+    const inlineComments = reviewData.inlineComments || [];
+    
+    for (const comment of inlineComments) {
+      const positions = diffPositionMap[comment.file];
+      if (!positions) {
+        console.log(`   ⚠️ Skipping comment for ${comment.file} - file not in diff`);
+        continue;
+      }
+
+      // Find the position in the diff for this line
+      const diffPosition = positions[comment.line];
+      if (!diffPosition) {
+        console.log(`   ⚠️ Skipping comment for ${comment.file}:${comment.line} - line not in diff`);
+        continue;
+      }
+
+      const severityEmoji = {
+        'error': '🔴',
+        'warning': '⚠️',
+        'suggestion': '💡',
+        'info': 'ℹ️'
+      }[comment.severity] || '💬';
+
+      reviewComments.push({
+        path: comment.file,
+        position: diffPosition,  // Position in the diff, not the file
+        body: `${severityEmoji} **${comment.severity.toUpperCase()}**\n\n${comment.comment}`
+      });
+    }
+
+    console.log(`   📝 Posting ${reviewComments.length} inline comments...`);
+
+    const contextInfo = relevantContext.length > 0 
+      ? ` | 📚 ${relevantContext.length} context pieces used`
+      : '';
+
+    if (reviewComments.length > 0) {
+      await octokit.pulls.createReview({
+        owner: REPO_OWNER,
+        repo: REPO_NAME,
+        pull_number: PR_NUMBER,
+        commit_id: latestCommitSha,
+        body: `## 🤖 AI Code Review\n\n**Summary:** ${reviewData.summary}\n\n---\n*🧠 GPT-5.1 + RAG | ${validFiles.length} files reviewed${contextInfo}*`,
+        event: 'COMMENT',
+        comments: reviewComments
+      });
+      console.log('✅ Inline review posted successfully!');
+    } else {
+      console.log('⚠️ No inline comments matched diff positions');
+    }
+
     console.log(`🔗 View at: https://github.com/${REPO_OWNER}/${REPO_NAME}/pull/${PR_NUMBER}`);
 
   } catch (error) {

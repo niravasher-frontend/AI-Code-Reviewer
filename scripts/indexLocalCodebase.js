@@ -6,7 +6,7 @@ import ignore from 'ignore';
 import { pipeline } from '@xenova/transformers';
 
 // ⚠️ HARDCODED CREDENTIALS - Only Pinecone needed now
-const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
+const PINECONE_API_KEY = 'pcsk_3Ma7XQ_AYYenjWUYZYJBfToZZDg3zUBTePRaS7HoBvSdDs7d1h2TrCUBDDBhiFcSVESh9M';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
 const pinecone = new Pinecone({ apiKey: PINECONE_API_KEY });
