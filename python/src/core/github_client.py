@@ -277,6 +277,127 @@ def fetch_repo_files(
         return []
 
 
+def post_review_with_inline_comments(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    summary: str,
+    inline_comments: List[Dict[str, Any]],
+    head_sha: str,
+) -> Dict[str, Any]:
+    """
+    Post a PR review with inline comments on specific lines.
+
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        pr_number: Pull request number.
+        summary: Summary comment body (markdown).
+        inline_comments: List of inline comment dicts with:
+            - path: File path
+            - line: Line number (in the diff, not file)
+            - body: Comment body
+        head_sha: Commit SHA to attach review to.
+
+    Returns:
+        Dict with review info (id, url).
+    """
+    logger.info(f"Posting review with {len(inline_comments)} inline comments")
+
+    repository = get_repository(owner, repo)
+    pr = repository.get_pull(pr_number)
+
+    # Format comments for PyGithub
+    # PyGithub expects: path, position (line in diff), body
+    # But we'll use the simpler single-comment review approach
+
+    try:
+        # First, try to create a review with inline comments
+        if inline_comments:
+            # PyGithub's create_review expects comments in specific format
+            comments = []
+            for comment in inline_comments:
+                # GitHub API requires 'position' or 'line' for the diff
+                # We'll use 'line' which is the line in the new file
+                comments.append({
+                    "path": comment["path"],
+                    "line": comment["line"],
+                    "body": comment["body"],
+                })
+
+            try:
+                # Create review with inline comments
+                review = pr.create_review(
+                    body=summary,
+                    event="COMMENT",  # COMMENT, APPROVE, or REQUEST_CHANGES
+                    comments=comments,
+                )
+
+                logger.info(f"Review created with inline comments: {review.html_url}")
+                return {
+                    "id": review.id,
+                    "url": review.html_url,
+                    "comments_count": len(comments),
+                }
+            except GithubException as e:
+                # If inline comments fail (e.g., line not in diff),
+                # fall back to posting summary + individual comments
+                logger.warning(f"Inline comments failed: {e}, falling back to individual comments")
+
+                # Post summary as PR comment
+                issue = repository.get_issue(pr_number)
+                comment = issue.create_comment(summary)
+
+                # Post inline comments individually
+                successful_comments = 0
+                for ic in inline_comments:
+                    try:
+                        pr.create_review_comment(
+                            body=ic["body"],
+                            commit=pr.get_commits().reversed[0],  # Latest commit
+                            path=ic["path"],
+                            line=ic["line"],
+                        )
+                        successful_comments += 1
+                    except Exception as ce:
+                        logger.warning(f"Could not post comment on {ic['path']}:{ic['line']}: {ce}")
+
+                return {
+                    "id": comment.id,
+                    "url": comment.html_url,
+                    "comments_count": successful_comments,
+                    "fallback": True,
+                }
+        else:
+            # No inline comments, just post summary
+            issue = repository.get_issue(pr_number)
+            comment = issue.create_comment(summary)
+
+            logger.info(f"Review comment posted: {comment.html_url}")
+            return {
+                "id": comment.id,
+                "url": comment.html_url,
+                "comments_count": 0,
+            }
+
+    except GithubException as e:
+        logger.error(f"Error posting review: {e}")
+
+        # Final fallback: just post the summary
+        try:
+            issue = repository.get_issue(pr_number)
+            comment = issue.create_comment(summary)
+            return {
+                "id": comment.id,
+                "url": comment.html_url,
+                "comments_count": 0,
+                "error": str(e),
+            }
+        except Exception as final_e:
+            logger.error(f"Complete failure posting review: {final_e}")
+            raise
+
+
 def filter_pr_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Filter PR files to only include reviewable code files.

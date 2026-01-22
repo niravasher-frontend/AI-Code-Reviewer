@@ -1,6 +1,6 @@
 """
 GitHub webhook handler for pull request events.
-Processes PRs, retrieves context via RAG, and posts AI-powered reviews.
+Processes PRs using R³ multi-agent system for risk-aware reviews.
 """
 
 import hmac
@@ -9,29 +9,26 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request
-from openai import OpenAI
 
-from src.config import (
-    get_settings,
-    OPENAI_MODEL,
-    OPENAI_MAX_TOKENS,
-    OPENAI_TEMPERATURE,
-    CONTEXT_TOP_K,
-)
+from src.config import get_settings, CONTEXT_TOP_K
 from src.core.embeddings import create_embedding
 from src.core.github_client import (
     get_pr_files,
     get_file_content,
-    post_review_comment,
+    post_review_with_inline_comments,
     filter_pr_files,
 )
 from src.core.pinecone_client import query_vectors
-from src.core.prompt_builder import build_review_prompt, build_context_query
-from src.api.schemas import ReviewResponse, ErrorResponse
+from src.core.prompt_builder import build_context_query
+from src.api.schemas import ReviewResponse, R3ReviewResponse, ErrorResponse
+from src.agents.orchestrator import Orchestrator
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Initialize orchestrator
+orchestrator = Orchestrator()
 
 
 def verify_webhook_signature(payload: bytes, signature: str, secret: str) -> bool:
@@ -60,9 +57,9 @@ def verify_webhook_signature(payload: bytes, signature: str, secret: str) -> boo
 
 @router.post(
     "/webhook",
-    response_model=ReviewResponse,
+    response_model=R3ReviewResponse,
     responses={
-        200: {"model": ReviewResponse},
+        200: {"model": R3ReviewResponse},
         405: {"model": ErrorResponse},
         500: {"model": ErrorResponse},
     },
@@ -71,13 +68,16 @@ async def handle_webhook(
     request: Request,
     x_github_event: Optional[str] = Header(None),
     x_hub_signature_256: Optional[str] = Header(None),
-) -> ReviewResponse:
+) -> R3ReviewResponse:
     """
     Handle GitHub webhook events for pull requests.
 
-    Processes pull_request events when a PR is opened or synchronized,
-    retrieves relevant context from the knowledge base, generates an
-    AI-powered code review, and posts it as a comment on the PR.
+    Uses R³ multi-agent system to:
+    1. Calculate risk signals (churn, complexity, incidents, etc.)
+    2. Perform AI-powered code review
+    3. Scan for security vulnerabilities
+    4. Post summary + inline comments to PR
+    5. Save audit trace
     """
     settings = get_settings()
 
@@ -98,7 +98,15 @@ async def handle_webhook(
     # Only process pull request events
     if x_github_event != "pull_request":
         logger.info(f"Ignoring non-PR event: {x_github_event}")
-        return ReviewResponse(message="Not a PR event")
+        return R3ReviewResponse(
+            message="Not a PR event",
+            files_reviewed=0,
+            risk_score=0,
+            risk_level="Low",
+            signals=[],
+            inline_comments_count=0,
+            audit_id="",
+        )
 
     action = payload.get("action", "")
     pull_request = payload.get("pull_request", {})
@@ -107,18 +115,26 @@ async def handle_webhook(
     # Only review when PR is opened, reopened, or synchronized (new commits)
     if action not in ["opened", "synchronize", "reopened"]:
         logger.info(f"No action needed for: {action}")
-        return ReviewResponse(message="No action needed")
+        return R3ReviewResponse(
+            message="No action needed",
+            files_reviewed=0,
+            risk_score=0,
+            risk_level="Low",
+            signals=[],
+            inline_comments_count=0,
+            audit_id="",
+        )
 
     try:
         owner = repository.get("owner", {}).get("login", "")
         repo_name = repository.get("name", "")
         pr_number = pull_request.get("number", 0)
         head_sha = pull_request.get("head", {}).get("sha", "")
+        pr_author = pull_request.get("user", {}).get("login", "unknown")
 
-        logger.info(f"Processing PR: {owner}/{repo_name}#{pr_number}")
-
-        # Initialize OpenAI client
-        openai_client = OpenAI(api_key=settings.openai_api_key)
+        logger.info("=" * 60)
+        logger.info(f"🎯 R³ Processing PR: {owner}/{repo_name}#{pr_number}")
+        logger.info("=" * 60)
 
         # Get PR files
         files = get_pr_files(owner, repo_name, pr_number)
@@ -128,7 +144,15 @@ async def handle_webhook(
 
         if not code_files:
             logger.info("No code files to review")
-            return ReviewResponse(message="No code files to review")
+            return R3ReviewResponse(
+                message="No code files to review",
+                files_reviewed=0,
+                risk_score=0,
+                risk_level="Low",
+                signals=[],
+                inline_comments_count=0,
+                audit_id="",
+            )
 
         # Get file contents
         valid_files = []
@@ -142,13 +166,23 @@ async def handle_webhook(
                         "patch": file.get("patch"),
                         "content": content,
                         "status": file.get("status"),
+                        "additions": file.get("additions", 0),
+                        "deletions": file.get("deletions", 0),
                     })
             except Exception as e:
                 logger.error(f"Error fetching {filename}: {e}")
 
         if not valid_files:
             logger.warning("Could not fetch any file contents")
-            return ReviewResponse(message="Could not fetch file contents")
+            return R3ReviewResponse(
+                message="Could not fetch file contents",
+                files_reviewed=0,
+                risk_score=0,
+                risk_level="Low",
+                signals=[],
+                inline_comments_count=0,
+                audit_id="",
+            )
 
         # RAG Enhancement: Retrieve relevant context from knowledge base
         logger.info("Querying knowledge base for relevant context...")
@@ -169,60 +203,54 @@ async def handle_webhook(
             logger.warning(f"Error retrieving context from knowledge base: {e}")
             # Continue without context if retrieval fails
 
-        # Build context-aware prompt
-        prompt = build_review_prompt(
-            pull_request=pull_request,
-            files=valid_files,
-            relevant_context=relevant_context,
+        # Build context for R³ agents
+        pr_context = {
+            "owner": owner,
+            "repo": repo_name,
+            "pr_number": pr_number,
+            "author": pr_author,
+            "head_sha": head_sha,
+            "files": valid_files,
+            "rag_context": relevant_context,
+            "pr_title": pull_request.get("title", ""),
+            "pr_body": pull_request.get("body", ""),
+        }
+
+        # Run R³ multi-agent review
+        logger.info("Running R³ multi-agent review...")
+        result = await orchestrator.review_pr(pr_context)
+
+        # Post review with inline comments
+        logger.info("Posting review to GitHub...")
+
+        inline_comments_data = [
+            {
+                "path": c.path,
+                "line": c.line,
+                "body": c.body,
+            }
+            for c in result["inline_comments"]
+        ]
+
+        review_result = post_review_with_inline_comments(
+            owner=owner,
+            repo=repo_name,
+            pr_number=pr_number,
+            summary=result["summary_comment"],
+            inline_comments=inline_comments_data,
+            head_sha=head_sha,
         )
 
-        logger.info(f"Sending request to OpenAI ({OPENAI_MODEL})...")
+        logger.info(f"✅ Review posted: {review_result.get('url', 'N/A')}")
 
-        # Call OpenAI with enhanced prompt
-        completion = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a senior software engineer performing code reviews. "
-                        "You have access to the codebase context and documentation. "
-                        "Be helpful, specific, constructive, and leverage the provided "
-                        "context to make informed recommendations."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
-            max_completion_tokens=OPENAI_MAX_TOKENS,
-        )
-
-        review_comment = completion.choices[0].message.content
-
-        # Build review metadata
-        context_info = ""
-        if relevant_context:
-            context_info = f"\n*Analyzed with {len(relevant_context)} pieces of codebase context*"
-
-        # Format final comment
-        final_comment = (
-            f"## AI Code Review (RAG-Enhanced)\n\n"
-            f"{review_comment}\n\n"
-            f"---\n"
-            f"*Powered by GPT-4 + Knowledge Base | Context-Aware Review*{context_info}"
-        )
-
-        # Post review comment
-        post_review_comment(owner, repo_name, pr_number, final_comment)
-
-        logger.info("Review posted successfully!")
-
-        return ReviewResponse(
-            message="Review posted successfully",
+        return R3ReviewResponse(
+            message="R³ review posted successfully",
             files_reviewed=len(valid_files),
-            context_pieces_used=len(relevant_context),
+            risk_score=result["risk_score"],
+            risk_level=result["risk_level"].value,
+            signals=result["signals"],
+            inline_comments_count=len(result["inline_comments"]),
+            audit_id=result["audit_id"],
             rag_enabled=True,
         )
 
@@ -232,3 +260,18 @@ async def handle_webhook(
             status_code=500,
             detail=f"Failed to process review: {str(e)}",
         )
+
+
+# Legacy endpoint for backward compatibility
+@router.post("/webhook/legacy", response_model=ReviewResponse)
+async def handle_webhook_legacy(
+    request: Request,
+    x_github_event: Optional[str] = Header(None),
+    x_hub_signature_256: Optional[str] = Header(None),
+) -> ReviewResponse:
+    """Legacy webhook handler without R³ risk analysis."""
+    # This can be implemented if needed for fallback
+    return ReviewResponse(
+        message="Legacy endpoint - use /webhook for R³ reviews",
+        files_reviewed=0,
+    )
