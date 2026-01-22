@@ -2,6 +2,7 @@ import { Octokit } from '@octokit/rest';
 import OpenAI from 'openai';
 import { createEmbedding } from '../lib/embeddings.js';
 import { queryVectors } from '../lib/pinecone.js';
+import { analyzeRisk, exportAuditTrace } from '../lib/riskAnalysis.js';
 
 // Parse diff to map line numbers to diff positions
 function parseDiffPositions(patch) {
@@ -91,6 +92,24 @@ export default async function handler(req, res) {
       }));
     
     console.log(`📄 Extracted diffs for ${validFiles.length} files`);
+
+    // === RISK ANALYSIS: Multi-signal risk scoring ===
+    console.log('🔍 Running multi-agent risk analysis...');
+    let riskAnalysis = null;
+    try {
+      riskAnalysis = await analyzeRisk({
+        files: validFiles,
+        pullRequest: pull_request,
+        // These would come from external data sources in production
+        commitHistory: [],
+        coverageData: {},
+        incidentHistory: [],
+        flakeData: {}
+      });
+      console.log(`✅ Risk analysis: ${riskAnalysis.emoji} ${riskAnalysis.level} (${riskAnalysis.score})`);
+    } catch (riskError) {
+      console.error('⚠️ Risk analysis error:', riskError.message);
+    }
 
     // === RAG: Retrieve relevant context ===
     let relevantContext = [];
@@ -242,33 +261,47 @@ Return ONLY valid JSON, no markdown code blocks, no extra text.
       ? ` | 📚 ${relevantContext.length} context pieces used`
       : '';
 
+    // Build review body with risk analysis
+    const riskSummary = riskAnalysis ? riskAnalysis.summary : '';
+    const reviewBody = `## 🤖 AI Code Review\n\n**Summary:** ${reviewData.summary || 'Review complete.'}\n\n---\n\n${riskSummary}\n\n---\n*🧠 GPT-5.1 + RAG | ${validFiles.length} files reviewed${contextInfo}*`;
+
     if (reviewComments.length > 0) {
       await octokit.pulls.createReview({
         owner: repository.owner.login,
         repo: repository.name,
         pull_number: pull_request.number,
         commit_id: latestCommitSha,
-        body: `## 🤖 AI Code Review\n\n**Summary:** ${reviewData.summary || 'Review complete.'}\n\n---\n*🧠 GPT-5.1 + RAG | ${validFiles.length} files reviewed${contextInfo}*`,
+        body: reviewBody,
         event: 'COMMENT',
         comments: reviewComments
       });
-      console.log('✅ Inline review posted successfully!');
+      console.log('✅ Inline review with risk analysis posted successfully!');
     } else {
       // No valid inline positions, post summary only
       await octokit.issues.createComment({
         owner: repository.owner.login,
         repo: repository.name,
         issue_number: pull_request.number,
-        body: `## 🤖 AI Code Review\n\n${reviewData.summary || 'No issues found!'}\n\n---\n*🧠 GPT-5.1 + RAG*`
+        body: reviewBody
       });
-      console.log('✅ Summary comment posted (no inline positions matched).');
+      console.log('✅ Summary with risk analysis posted (no inline positions matched).');
+    }
+
+    // Log audit trace
+    if (riskAnalysis) {
+      console.log('📋 Audit Trace:', exportAuditTrace(riskAnalysis));
     }
 
     return res.status(200).json({ 
       message: 'Review posted successfully',
       filesReviewed: validFiles.length,
       inlineComments: reviewComments.length,
-      ragEnabled: true
+      ragEnabled: true,
+      riskAnalysis: riskAnalysis ? {
+        score: riskAnalysis.score,
+        level: riskAnalysis.level,
+        traceId: riskAnalysis.auditTrace?.traceId
+      } : null
     });
 
   } catch (error) {
