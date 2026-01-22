@@ -4,6 +4,36 @@ import { createEmbedding } from '../lib/embeddings.js';
 import { queryVectors } from '../lib/pinecone.js';
 import { analyzeRisk, exportAuditTrace } from '../lib/riskAnalysis.js';
 
+// Dashboard API URL for logging
+const DASHBOARD_API = 'https://ai-code-reviewer-beta-green.vercel.app/api/dashboard';
+
+// Helper to send logs to dashboard
+async function sendLog(source, message, level = 'INFO') {
+  try {
+    await fetch(`${DASHBOARD_API}?action=add-log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, message, level })
+    });
+  } catch (e) {
+    // Ignore errors - dashboard logging is optional
+  }
+  console.log(`[${level}] [${source}] ${message}`);
+}
+
+// Helper to send review to dashboard
+async function sendReview(review) {
+  try {
+    await fetch(`${DASHBOARD_API}?action=add-review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(review)
+    });
+  } catch (e) {
+    // Ignore errors
+  }
+}
+
 // Parse diff to map line numbers to diff positions
 function parseDiffPositions(patch) {
   const lines = patch.split('\n');
@@ -53,7 +83,12 @@ export default async function handler(req, res) {
 
   console.log(`🚀 Reviewing PR #${pull_request.number} in ${repository.full_name}`);
 
+  // Start dashboard logging
+  await sendLog('webhook', '════════════════════════════════════════════');
+  await sendLog('webhook', `🚀 Starting review for ${repository.full_name}#${pull_request.number}`);
+
   try {
+    await sendLog('github_client', 'Initializing GitHub client...');
     const octokit = new Octokit({
       auth: process.env.GITHUB_TOKEN
     });
@@ -61,13 +96,16 @@ export default async function handler(req, res) {
     const openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY
     });
+    await sendLog('github_client', 'GitHub client initialized successfully');
 
     // Get PR files
+    await sendLog('github_client', `Fetching PR files: ${repository.full_name}#${pull_request.number}`);
     const { data: files } = await octokit.pulls.listFiles({
       owner: repository.owner.login,
       repo: repository.name,
       pull_number: pull_request.number
     });
+    await sendLog('github_client', `Found ${files.length} files in PR`);
 
     // Filter out binary files and very large files
     const codeFiles = files.filter(file => 
@@ -75,8 +113,10 @@ export default async function handler(req, res) {
       file.changes < 500 &&
       !file.filename.match(/\.(png|jpg|jpeg|gif|svg|ico|lock|min\.js)$/)
     );
+    await sendLog('github_client', `Filtered to ${codeFiles.length} reviewable files`);
 
     if (codeFiles.length === 0) {
+      await sendLog('webhook', '⚠️ No code files to review', 'WARN');
       return res.status(200).json({ message: 'No code files to review' });
     }
 
@@ -95,6 +135,16 @@ export default async function handler(req, res) {
 
     // === RISK ANALYSIS: Multi-signal risk scoring ===
     console.log('🔍 Running multi-agent risk analysis...');
+    await sendLog('webhook', '🔍 Starting multi-agent risk analysis...');
+    
+    // Log each agent starting
+    await sendLog('ChurnAgent', 'Analyzing code churn patterns...');
+    await sendLog('CoverageGapAgent', 'Checking test coverage gaps...');
+    await sendLog('IncidentHotspotAgent', 'Identifying incident hotspots...');
+    await sendLog('FlakeProximityAgent', 'Detecting flaky test proximity...');
+    await sendLog('DiffRiskAgent', 'Evaluating diff complexity...');
+    await sendLog('TimePressureAgent', 'Assessing time pressure factors...');
+    
     let riskAnalysis = null;
     try {
       riskAnalysis = await analyzeRisk({
@@ -106,19 +156,31 @@ export default async function handler(req, res) {
         incidentHistory: [],
         flakeData: {}
       });
+      
+      // Log agent results
+      for (const [name, signal] of Object.entries(riskAnalysis.signals)) {
+        const agentName = name.charAt(0).toUpperCase() + name.slice(1).replace(/_/g, '') + 'Agent';
+        await sendLog(agentName, `Score: ${signal.score} - ${signal.explanation.substring(0, 60)}...`);
+      }
+      
+      await sendLog('webhook', `✅ Risk Analysis Complete: ${riskAnalysis.emoji} ${riskAnalysis.level} (${riskAnalysis.score})`);
       console.log(`✅ Risk analysis: ${riskAnalysis.emoji} ${riskAnalysis.level} (${riskAnalysis.score})`);
     } catch (riskError) {
+      await sendLog('webhook', `⚠️ Risk analysis error: ${riskError.message}`, 'ERROR');
       console.error('⚠️ Risk analysis error:', riskError.message);
     }
 
     // === RAG: Retrieve relevant context ===
+    await sendLog('pinecone_client', 'Querying knowledge base for relevant context...');
     let relevantContext = [];
     try {
       const queryText = `${pull_request.title} ${pull_request.body || ''} ${validFiles.map(f => f.filename).join(' ')}`;
       const queryEmbedding = await createEmbedding(queryText);
       relevantContext = await queryVectors(queryEmbedding, 10);
+      await sendLog('pinecone_client', `Retrieved ${relevantContext.length} relevant context pieces`);
       console.log(`✅ Retrieved ${relevantContext.length} context pieces`);
     } catch (error) {
+      await sendLog('pinecone_client', `Error: ${error.message}`, 'ERROR');
       console.error('⚠️ RAG error:', error.message);
     }
 
@@ -175,6 +237,7 @@ Return ONLY valid JSON, no markdown code blocks, no extra text.
 `;
 
     console.log('🤖 Calling OpenAI for inline review...');
+    await sendLog('openai_client', 'Sending review request to GPT-5.1...');
 
     const completion = await openai.chat.completions.create({
       model: "gpt-5.1",
@@ -193,6 +256,7 @@ Return ONLY valid JSON, no markdown code blocks, no extra text.
     });
 
     const rawResponse = completion.choices[0].message.content || '{}';
+    await sendLog('openai_client', `Received response (${rawResponse.length} chars)`);
     
     // Parse JSON response
     let reviewData;
@@ -255,6 +319,7 @@ Return ONLY valid JSON, no markdown code blocks, no extra text.
       });
     }
 
+    await sendLog('github_client', `Posting ${reviewComments.length} inline comments...`);
     console.log(`📝 Posting ${reviewComments.length} inline comments...`);
 
     const contextInfo = relevantContext.length > 0 
@@ -275,6 +340,7 @@ Return ONLY valid JSON, no markdown code blocks, no extra text.
         event: 'COMMENT',
         comments: reviewComments
       });
+      await sendLog('github_client', '✅ Review posted to GitHub successfully!');
       console.log('✅ Inline review with risk analysis posted successfully!');
     } else {
       // No valid inline positions, post summary only
@@ -284,6 +350,7 @@ Return ONLY valid JSON, no markdown code blocks, no extra text.
         issue_number: pull_request.number,
         body: reviewBody
       });
+      await sendLog('github_client', '✅ Summary posted (no inline positions matched)', 'WARN');
       console.log('✅ Summary with risk analysis posted (no inline positions matched).');
     }
 
@@ -291,6 +358,18 @@ Return ONLY valid JSON, no markdown code blocks, no extra text.
     if (riskAnalysis) {
       console.log('📋 Audit Trace:', exportAuditTrace(riskAnalysis));
     }
+
+    // Send review to dashboard
+    await sendReview({
+      repo: repository.full_name,
+      prNumber: pull_request.number,
+      riskScore: riskAnalysis ? riskAnalysis.score : 0,
+      author: pull_request.user.login,
+      comments: reviewComments.length
+    });
+
+    await sendLog('webhook', `✅ Review complete for PR #${pull_request.number}`);
+    await sendLog('webhook', '════════════════════════════════════════════');
 
     return res.status(200).json({ 
       message: 'Review posted successfully',
@@ -305,6 +384,7 @@ Return ONLY valid JSON, no markdown code blocks, no extra text.
     });
 
   } catch (error) {
+    await sendLog('webhook', `❌ Error: ${error.message}`, 'ERROR');
     console.error('❌ Error:', error);
     return res.status(500).json({ 
       error: 'Failed to process review',
